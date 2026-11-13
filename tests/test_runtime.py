@@ -3,7 +3,9 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from threading import Barrier, Condition, Event, Lock, Thread, current_thread
+from typing import Any
 from unittest.mock import patch
+from uuid import UUID
 
 from taskforge import (
     Job,
@@ -13,6 +15,7 @@ from taskforge import (
     Runtime,
     RuntimeClosedError,
 )
+from taskforge.worker import WorkItem
 
 LIMIT = 5.0
 
@@ -231,6 +234,52 @@ class RuntimeTests(unittest.TestCase):
             attempts = [callers.submit(cancel) for _ in range(4)]
             self.assertEqual(sum(attempt.result(LIMIT) for attempt in attempts), 1)
         self.assertIs(pending.state, JobState.CANCELLED)
+
+    def test_cancel_racing_worker_claim_has_exactly_one_winner(self) -> None:
+        for cancel_first in (True, False):
+            with self.subTest(cancel_first=cancel_first):
+                self.check_claim_race(cancel_first)
+
+    def check_claim_race(self, cancel_first: bool) -> None:
+        take, cancel = Runtime._take, Runtime._cancel
+        # Pause both real contenders immediately before queue access.
+        at_claim, at_cancel = Event(), Event()
+        claimed, cancelled = Event(), Event()
+        calls: list[int] = []
+
+        def gated_take(pool: Runtime) -> WorkItem[Any] | None:
+            at_claim.set()
+            wait(at_cancel)
+            if cancel_first:
+                wait(cancelled)
+            item = take(pool)
+            claimed.set()
+            return item
+
+        def gated_cancel(pool: Runtime, key: UUID) -> bool:
+            at_cancel.set()
+            wait(at_claim)
+            if not cancel_first:
+                wait(claimed)
+            won = cancel(pool, key)
+            cancelled.set()
+            return won
+
+        with (
+            patch.object(Runtime, "_take", gated_take),
+            patch.object(Runtime, "_cancel", gated_cancel),
+            Runtime(1, 1) as pool,
+        ):
+            job = pool.submit(calls.append, 1)
+            self.assertEqual(job.cancel(), cancel_first)
+            if cancel_first:
+                with self.assertRaises(JobCancelledError):
+                    job.result(LIMIT)
+                self.assertIs(job.state, JobState.CANCELLED)
+            else:
+                self.assertIsNone(job.result(LIMIT))
+                self.assertIs(job.state, JobState.COMPLETED)
+        self.assertEqual(calls, [] if cancel_first else [1])
 
     def test_concurrent_producers_no_lost_or_duplicate_work(self) -> None:
         runtime = self.pool(workers=3, capacity=2)
