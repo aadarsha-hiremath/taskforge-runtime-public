@@ -5,12 +5,15 @@ from types import TracebackType
 from typing import Any, Self
 from uuid import uuid4
 
+from .observability import WorkerHealth, WorkerState
 from .scheduling import ScheduledPool, WorkItem
 from .worker import worker_loop
 
 
 class Runtime(ScheduledPool[Callable[[], Any]]):
     """Start a fixed pool. Queue capacity counts waiting jobs only."""
+
+    _backend = "thread"
 
     def __init__(
         self, workers: int = 2, queue_capacity: int = 16, *, priority_burst: int = 8
@@ -24,16 +27,37 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
         try:
             for index in range(workers):
                 thread = Thread(
-                    target=worker_loop,
-                    args=(self._take, self._finish),
+                    target=self._run_worker,
                     name=f"taskforge-{pool_id}-{index}",
                     daemon=False,
                 )
-                thread.start()
+                with self._changed:
+                    self._health[thread.name] = WorkerHealth(
+                        thread.name, WorkerState.IDLE
+                    )
+                    try:
+                        thread.start()
+                    except BaseException:
+                        del self._health[thread.name]
+                        raise
                 self._workers.append(thread)
         except BaseException:
             self.shutdown()
             raise
+
+    def _run_worker(self) -> None:
+        expected = False
+        try:
+            worker_loop(self._take, self._finish)
+            expected = True
+        finally:
+            with self._changed:
+                self._worker_exit(current_thread().name, expected)
+                if not expected and all(
+                    w.state in (WorkerState.EXITED, WorkerState.FAILED)
+                    for w in self._health.values()
+                ):
+                    self._no_workers()
 
     def _prepare(
         self, fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -63,7 +87,7 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
     def _take(self) -> WorkItem[Callable[[], Any]] | None:
         with self._changed:
             while True:
-                item = self._claim()
+                item = self._claim(current_thread().name)
                 if item is not None or (self._closed and not self._pending):
                     return item
                 self._changed.wait(self._retry_timeout())
@@ -91,3 +115,4 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
         tb: TracebackType | None,
     ) -> None:
         self.shutdown()
+

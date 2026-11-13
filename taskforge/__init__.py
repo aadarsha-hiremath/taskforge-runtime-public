@@ -10,6 +10,7 @@ from .errors import (
     WorkerLostError,
 )
 from .job import Job, JobState
+from .observability import RuntimeSnapshot, WorkerHealth, WorkerState
 from .process_runtime import ProcessRuntime
 from .scheduler import Runtime
 from .scheduling import Schedule
@@ -24,7 +25,10 @@ __all__ = [
     "RemoteTaskError",
     "Runtime",
     "RuntimeClosedError",
+    "RuntimeSnapshot",
     "Schedule",
     "SerializationError",
+    "WorkerHealth",
     "WorkerLostError",
+    "WorkerState",
 ]

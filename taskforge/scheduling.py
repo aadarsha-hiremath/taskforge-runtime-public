@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
@@ -11,8 +12,9 @@ from time import monotonic
 from typing import Any, Generic, ParamSpec, TypeVar
 from uuid import UUID
 
-from .errors import QueueFullError, RuntimeClosedError
+from .errors import QueueFullError, RuntimeClosedError, WorkerLostError
 from .job import Job, JobState
+from .observability import RuntimeSnapshot, WorkerHealth, WorkerState
 
 Payload = TypeVar("Payload")
 P = ParamSpec("P")
@@ -58,9 +60,12 @@ class WorkItem(Generic[Payload]):
     deadline: float | None
     ready_at: float = 0
     reserved: bool = False
+    worker_id: str = ""
 
 
 class ScheduledPool(ABC, Generic[Payload]):
+    _backend: str
+
     def __init__(self, capacity: int, priority_burst: int) -> None:
         if type(capacity) is not int or capacity < 1:
             raise ValueError("queue_capacity must be a positive integer")
@@ -74,6 +79,57 @@ class ScheduledPool(ABC, Generic[Payload]):
         self._cancel_retries = False
         self._reserved = 0
         self._pending: dict[UUID, WorkItem[Payload]] = {}
+        self._health: dict[str, WorkerHealth] = {}
+        self._outcomes: Counter[JobState] = Counter()
+        self._accepted = self._started = self._attempts = self._retries = 0
+
+    def snapshot(self) -> RuntimeSnapshot:
+        """Read counters and worker assignments atomically, without advancing timers."""
+        with self._changed:
+            workers = tuple(self._health.values())
+            return RuntimeSnapshot(
+                backend=self._backend,
+                closed=self._closed,
+                stopped=self._closed
+                and all(
+                    w.state in (WorkerState.EXITED, WorkerState.FAILED) for w in workers
+                ),
+                accepted=self._accepted,
+                started=self._started,
+                attempts=self._attempts,
+                retries_scheduled=self._retries,
+                completed=self._outcomes[JobState.COMPLETED],
+                failed=self._outcomes[JobState.FAILED],
+                cancelled=self._outcomes[JobState.CANCELLED],
+                expired=self._outcomes[JobState.EXPIRED],
+                pending=len(self._pending),
+                reserved=self._reserved,
+                capacity=self._capacity,
+                workers=workers,
+            )
+
+    def _leave_pending(self, job: Job[Any], state: JobState) -> None:
+        self._outcomes[state] += 1
+        job._leave_queue(state)
+
+    def _fail_job(self, job: Job[Any], error: BaseException) -> None:
+        self._outcomes[JobState.FAILED] += 1
+        job._fail(error)
+
+    def _no_workers(self) -> None:
+        self._closed = True
+        for item in self._pending.values():
+            self._fail_job(
+                item.job, WorkerLostError("no worker available to run the queued job")
+            )
+        self._pending.clear()
+        self._changed.notify_all()
+
+    def _worker_exit(
+        self, worker_id: str, expected: bool, code: int | None = None
+    ) -> None:
+        state = WorkerState.EXITED if expected else WorkerState.FAILED
+        self._health[worker_id] = WorkerHealth(worker_id, state, exit_code=code)
 
     def _ensure_timer(self) -> None:
         """Thread pools override this when deadlines need an independent timer."""
@@ -86,7 +142,7 @@ class ScheduledPool(ABC, Generic[Payload]):
         ]
         if due:
             for key in due:
-                self._pending.pop(key).job._leave_queue(JobState.EXPIRED)
+                self._leave_pending(self._pending.pop(key).job, JobState.EXPIRED)
             self._signal()
 
     def _expire_due(self) -> None:
@@ -152,11 +208,13 @@ class ScheduledPool(ABC, Generic[Payload]):
             deadline = None
             if schedule.start_within is not None:
                 if schedule.start_within == 0:
-                    job._leave_queue(JobState.EXPIRED)
+                    self._accepted += 1
+                    self._leave_pending(job, JobState.EXPIRED)
                     return job
                 self._ensure_timer()
                 deadline = monotonic() + schedule.start_within
             self._pending[job.id] = WorkItem(job, payload, schedule, deadline)
+            self._accepted += 1
             self._signal()
             return job
 
@@ -164,7 +222,7 @@ class ScheduledPool(ABC, Generic[Payload]):
         self._expire_due()
         return self._closed or len(self._pending) + self._reserved < self._capacity
 
-    def _claim(self) -> WorkItem[Payload] | None:
+    def _claim(self, worker_id: str) -> WorkItem[Payload] | None:
         """Called under the queue condition. Dict insertion order breaks ties."""
         now = monotonic()
         self._expire(now)
@@ -178,7 +236,14 @@ class ScheduledPool(ABC, Generic[Payload]):
         self._bypasses = self._bypasses + 1 if item is not oldest else 0
         del self._pending[item.job.id]
         item.job._leave_queue(JobState.RUNNING)
-        item.reserved = item.job.attempts <= item.schedule.max_retries
+        attempts = item.job.attempts
+        self._attempts += 1
+        self._started += int(attempts == 1)
+        item.worker_id = worker_id
+        self._health[worker_id] = WorkerHealth(
+            worker_id, WorkerState.RUNNING, item.job.id
+        )
+        item.reserved = attempts <= item.schedule.max_retries
         if item.reserved:
             self._reserved += 1
         self._changed.notify_all()
@@ -199,31 +264,36 @@ class ScheduledPool(ABC, Generic[Payload]):
         retryable: bool = False,
     ) -> None:
         with self._changed:
+            self._health[item.worker_id] = WorkerHealth(
+                item.worker_id, WorkerState.IDLE
+            )
             if item.reserved:
                 self._reserved -= 1
                 item.reserved = False
                 if retryable and not self._cancel_retries:
                     now = monotonic()
                     if item.deadline is not None and item.deadline <= now:
-                        item.job._leave_queue(JobState.EXPIRED)
+                        self._leave_pending(item.job, JobState.EXPIRED)
                     else:
                         if item.deadline is not None:
                             try:
                                 self._ensure_timer()
                             except RuntimeError as timer_error:
-                                item.job._fail(timer_error)
+                                self._fail_job(item.job, timer_error)
                                 self._signal()
                                 return
                         item.ready_at = now + item.schedule.retry_delay
                         item.job._retry(self._cancel)
                         self._pending[item.job.id] = item
+                        self._retries += 1
                     self._signal()
                     return
                 self._changed.notify_all()
             if error is None:
+                self._outcomes[JobState.COMPLETED] += 1
                 item.job._complete(value)
             else:
-                item.job._fail(error)
+                self._fail_job(item.job, error)
 
     def _cancel(self, job_id: UUID) -> bool:
         with self._changed:
@@ -231,7 +301,7 @@ class ScheduledPool(ABC, Generic[Payload]):
             item = self._pending.pop(job_id, None)
             if item is None:
                 return False
-            item.job._leave_queue(JobState.CANCELLED)
+            self._leave_pending(item.job, JobState.CANCELLED)
             self._signal()
             return True
 
@@ -244,6 +314,6 @@ class ScheduledPool(ABC, Generic[Payload]):
                 self._cancel_retries = True
                 discarded, self._pending = self._pending, {}
                 for item in discarded.values():
-                    item.job._leave_queue(JobState.CANCELLED)
+                    self._leave_pending(item.job, JobState.CANCELLED)
             if changed:
                 self._signal()

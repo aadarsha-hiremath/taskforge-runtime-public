@@ -18,6 +18,7 @@ from .errors import (
     SerializationError,
     WorkerLostError,
 )
+from .observability import WorkerHealth, WorkerState
 from .process_worker import (
     CODEC_ERROR,
     READY,
@@ -43,11 +44,14 @@ class _Request:
 class _Worker:
     process: BaseProcess
     pipe: PipeEnd
+    worker_id: str
     item: WorkItem[_Request] | None = None
 
 
 class ProcessRuntime(ScheduledPool[_Request]):
     """Spawn workers and wait for their handshakes before accepting submissions."""
+
+    _backend = "process"
 
     def __init__(
         self,
@@ -85,7 +89,9 @@ class ProcessRuntime(ScheduledPool[_Request]):
                     raise
                 finally:
                     child.close()
-                self._workers.append(_Worker(process, parent))
+                worker_id = str(process.pid)
+                self._workers.append(_Worker(process, parent, worker_id))
+                self._health[worker_id] = WorkerHealth(worker_id, WorkerState.IDLE)
             for worker in self._workers:
                 if not worker.pipe.poll(max(0, deadline - monotonic())):
                     raise TimeoutError("process startup handshake timed out")
@@ -117,13 +123,17 @@ class ProcessRuntime(ScheduledPool[_Request]):
             self._wake_pending = True
 
     def _lose(self, worker: _Worker, reason: str) -> None:
-        worker.pipe.close()
-        if worker.item is not None:
-            self._finish(
-                worker.item,
-                error=WorkerLostError(f"worker {worker.process.pid}: {reason}"),
-            )
-            worker.item = None
+        with self._changed:
+            if worker.pipe.closed:
+                return
+            worker.pipe.close()
+            if worker.item is not None:
+                self._finish(
+                    worker.item,
+                    error=WorkerLostError(f"worker {worker.worker_id}: {reason}"),
+                )
+                worker.item = None
+            self._worker_exit(worker.worker_id, False)
 
     def _receive(self, worker: _Worker) -> None:
         try:
@@ -159,9 +169,12 @@ class ProcessRuntime(ScheduledPool[_Request]):
 
     def _dispatch(self, worker: _Worker) -> None:
         with self._changed:
-            item = self._claim()
+            item = self._claim(worker.worker_id)
             if item is None:
                 if self._closed and not self._pending:
+                    self._health[worker.worker_id] = WorkerHealth(
+                        worker.worker_id, WorkerState.STOPPING
+                    )
                     worker.pipe.close()
                 return
             worker.item = item
@@ -208,29 +221,32 @@ class ProcessRuntime(ScheduledPool[_Request]):
                         self._receive(worker)
                 for sentinel, worker in retiring.items():
                     if sentinel in ready:
-                        worker.process.join()
-                        worker.process.close()
+                        self._reap(worker)
                         self._workers.remove(worker)
         finally:
             with self._changed:
-                self._closed = True
-                for item in self._pending.values():
-                    item.job._fail(
-                        WorkerLostError("no worker available to run the queued job")
-                    )
-                self._pending.clear()
-                self._changed.notify_all()
+                self._no_workers()
             for worker in self._workers:
                 self._lose(worker, "controller stopped before receiving a result")
             self._cleanup()
+
+    def _reap(self, worker: _Worker) -> None:
+        worker.process.join()
+        code = worker.process.exitcode
+        worker.process.close()
+        with self._changed:
+            expected = (
+                self._health[worker.worker_id].state is WorkerState.STOPPING
+                and code == 0
+            )
+            self._worker_exit(worker.worker_id, expected, code)
 
     def _cleanup(self) -> None:
         self._wake_read.close()
         self._wake_write.close()
         for worker in self._workers:
             worker.pipe.close()
-            worker.process.join()
-            worker.process.close()
+            self._reap(worker)
 
     def shutdown(
         self,
