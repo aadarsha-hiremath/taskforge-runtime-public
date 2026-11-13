@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "taskforge-runtime"
 version = "0.1.0"
 description = "A bounded, thread-based FIFO job runtime"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
 
