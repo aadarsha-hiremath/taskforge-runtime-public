@@ -141,12 +141,7 @@ class ScheduledPool(ABC, Generic[Payload]):
                 raise RuntimeClosedError("runtime is closed")
         payload = self._prepare(fn, args, kwargs)
         with self._changed:
-            ready = self._changed.wait_for(
-                lambda: (
-                    self._closed or len(self._pending) + self._reserved < self._capacity
-                ),
-                schedule.submit_timeout,
-            )
+            ready = self._changed.wait_for(self._can_admit, schedule.submit_timeout)
             if self._closed:
                 raise RuntimeClosedError("runtime is closed")
             if not ready:
@@ -162,6 +157,10 @@ class ScheduledPool(ABC, Generic[Payload]):
             self._pending[job.id] = WorkItem(job, payload, schedule, deadline)
             self._signal()
             return job
+
+    def _can_admit(self) -> bool:
+        self._expire_due()
+        return self._closed or len(self._pending) + self._reserved < self._capacity
 
     def _claim(self) -> WorkItem[Payload] | None:
         """Called under the queue condition. Dict insertion order breaks ties."""

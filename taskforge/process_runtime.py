@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import pickle
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
-from math import isfinite
+from math import ceil, isfinite
 from multiprocessing.connection import wait as wait_connections
 from multiprocessing.process import BaseProcess
 from threading import Thread, current_thread
@@ -30,14 +31,22 @@ from .process_worker import (
 from .scheduling import ScheduledPool, WorkItem
 
 
+@dataclass(slots=True)
+class _Request:
+    data: bytes
+    # Manager proxies use reference-counted server objects. Keep the original
+    # inputs alive until every child-side reconstruction has finished.
+    inputs: tuple[tuple[Any, ...], dict[str, Any]]
+
+
 @dataclass
 class _Worker:
     process: BaseProcess
     pipe: PipeEnd
-    item: WorkItem[bytes] | None = None
+    item: WorkItem[_Request] | None = None
 
 
-class ProcessRuntime(ScheduledPool[bytes]):
+class ProcessRuntime(ScheduledPool[_Request]):
     """Spawn workers and wait for their handshakes before accepting submissions."""
 
     def __init__(
@@ -97,8 +106,8 @@ class ProcessRuntime(ScheduledPool[bytes]):
 
     def _prepare(
         self, fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> bytes:
-        return encode_call(fn, args, kwargs)
+    ) -> _Request:
+        return _Request(encode_call(fn, args, kwargs), (args, kwargs))
 
     def _signal(self) -> None:
         super()._signal()
@@ -157,7 +166,7 @@ class ProcessRuntime(ScheduledPool[bytes]):
                 return
             worker.item = item
         try:
-            worker.pipe.send_bytes(item.payload)
+            worker.pipe.send_bytes(item.payload.data)
         except (EOFError, OSError) as error:
             self._lose(worker, f"dispatch failed ({type(error).__name__})")
 
@@ -185,6 +194,10 @@ class ProcessRuntime(ScheduledPool[bytes]):
                     timeout = min(
                         (delay for delay in delays if delay is not None), default=None
                     )
+                    # Older Windows multiprocessing converts seconds to a signed
+                    # millisecond wait. Recompute long deadlines after one day.
+                    if sys.platform == "win32" and timeout is not None:
+                        timeout = ceil(min(timeout, 86400.0) * 1000) / 1000
                 ready = wait_connections([self._wake_read, *live, *retiring], timeout)
                 if self._wake_read in ready:
                     with self._changed:
