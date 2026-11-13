@@ -2,26 +2,22 @@ from __future__ import annotations
 
 import multiprocessing as mp
 import pickle
-from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
 from multiprocessing.connection import wait as wait_connections
 from multiprocessing.process import BaseProcess
-from threading import Condition, Thread, current_thread
+from threading import Thread, current_thread
 from time import monotonic
 from types import TracebackType
-from typing import Any, ParamSpec, Self, TypeVar
-from uuid import UUID
+from typing import Any, Self
 
 from .errors import (
-    QueueFullError,
     RemoteTaskError,
-    RuntimeClosedError,
     SerializationError,
     WorkerLostError,
 )
-from .job import Job, JobState
+from .job import Job
 from .process_worker import (
     CODEC_ERROR,
     READY,
@@ -31,9 +27,7 @@ from .process_worker import (
     encode_call,
     process_worker,
 )
-
-P = ParamSpec("P")
-T = TypeVar("T")
+from .scheduling import ScheduledPool
 
 
 @dataclass
@@ -43,7 +37,7 @@ class _Worker:
     job: Job[Any] | None = None
 
 
-class ProcessRuntime:
+class ProcessRuntime(ScheduledPool[bytes]):
     """Spawn workers and wait for their handshakes before accepting submissions."""
 
     def __init__(
@@ -51,20 +45,16 @@ class ProcessRuntime:
         workers: int = 2,
         queue_capacity: int = 16,
         *,
+        priority_burst: int = 8,
         startup_timeout: float = 30.0,
     ) -> None:
         # Python 3.11 on Windows has a limit on handles in a single wait set.
         if type(workers) is not int or not 1 <= workers <= 60:
             raise ValueError("workers must be an integer between 1 and 60")
-        if type(queue_capacity) is not int or queue_capacity < 1:
-            raise ValueError("queue_capacity must be a positive integer")
+        super().__init__(queue_capacity, priority_burst)
         if not isfinite(startup_timeout) or startup_timeout <= 0:
             raise ValueError("startup_timeout must be finite and positive")
         ctx = mp.get_context("spawn")
-        self._capacity = queue_capacity
-        self._changed = Condition()
-        self._closed = False
-        self._pending: OrderedDict[UUID, tuple[Job[Any], bytes]] = OrderedDict()
         self._wake_read, self._wake_write = ctx.Pipe(duplex=False)
         self._wake_pending = False
         self._workers: list[_Worker] = []
@@ -105,46 +95,13 @@ class ProcessRuntime:
             self._cleanup()
             raise
 
-    def submit(
-        self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
-    ) -> Job[T]:
-        return self.submit_with_timeout(None, fn, *args, **kwargs)
+    def _prepare(
+        self, fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> bytes:
+        return encode_call(fn, args, kwargs)
 
-    def submit_with_timeout(
-        self,
-        timeout: float | None,
-        fn: Callable[P, T],
-        /,
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> Job[T]:
-        with self._changed:
-            if self._closed:
-                raise RuntimeClosedError("process runtime is closed")
-        request = encode_call(fn, args, kwargs)
-        with self._changed:
-            ready = self._changed.wait_for(
-                lambda: self._closed or len(self._pending) < self._capacity, timeout
-            )
-            if self._closed:
-                raise RuntimeClosedError("process runtime is closed")
-            if not ready:
-                raise QueueFullError("job queue is full")
-            job = Job[T](self._cancel)
-            self._pending[job.id] = job, request
-            self._wake()
-            return job
-
-    def _cancel(self, job_id: UUID) -> bool:
-        with self._changed:
-            item = self._pending.pop(job_id, None)
-            if item is None:
-                return False
-            item[0]._leave_queue(JobState.CANCELLED)
-            self._changed.notify_all()
-            return True
-
-    def _wake(self) -> None:
+    def _signal(self) -> None:
+        super()._signal()
         # Caller holds the condition. At most one byte-sized message is outstanding.
         if not self._wake_pending:
             self._wake_write.send_bytes(b"!")
@@ -188,16 +145,14 @@ class ProcessRuntime:
 
     def _dispatch(self, worker: _Worker) -> None:
         with self._changed:
-            if not self._pending:
+            item = self._claim()
+            if item is None:
                 if self._closed:
-                    worker.pipe.close()  # EOF asks an idle worker to exit.
+                    worker.pipe.close()
                 return
-            _, (job, request) = self._pending.popitem(last=False)
-            worker.job = job
-            job._leave_queue(JobState.RUNNING)
-            self._changed.notify_all()
+            worker.job = item.job
         try:
-            worker.pipe.send_bytes(request)
+            worker.pipe.send_bytes(item.payload)
         except (EOFError, OSError) as error:
             self._lose(worker, f"dispatch failed ({type(error).__name__})")
 
@@ -230,8 +185,8 @@ class ProcessRuntime:
         finally:
             with self._changed:
                 self._closed = True
-                for job, _ in self._pending.values():
-                    job._fail(
+                for item in self._pending.values():
+                    item.job._fail(
                         WorkerLostError("no worker available to run the queued job")
                     )
                 self._pending.clear()
@@ -257,15 +212,7 @@ class ProcessRuntime:
     ) -> None:
         if wait and current_thread() is self._controller:
             raise RuntimeError("the controller cannot join itself")
-        with self._changed:
-            if cancel_pending:
-                for job, _ in self._pending.values():
-                    job._leave_queue(JobState.CANCELLED)
-                self._pending.clear()
-            if not self._closed:
-                self._closed = True
-                self._wake()
-            self._changed.notify_all()
+        self._close(cancel_pending)
         if wait:
             self._controller.join(timeout)
             if self._controller.is_alive():

@@ -11,6 +11,7 @@ from .errors import (
 from .job import Job, JobState
 from .process_runtime import ProcessRuntime
 from .scheduler import Runtime
+from .scheduling import Schedule
 
 __all__ = [
     "Job",
@@ -21,6 +22,7 @@ __all__ = [
     "RemoteTaskError",
     "Runtime",
     "RuntimeClosedError",
+    "Schedule",
     "SerializationError",
     "WorkerLostError",
 ]
