@@ -192,7 +192,8 @@ class SchedulingCases:
     def test_long_backoff_drains_on_clock_advance(self) -> None:
         pool = self.pool(capacity=1)
         with patch("taskforge.scheduling.monotonic", return_value=10.0) as clock:
-            delay = 3_000_000  # Valid Windows duration above signed 32-bit milliseconds.
+            # Valid Windows duration above signed 32-bit milliseconds.
+            delay = 3_000_000
             job = pool.submit_scheduled(
                 Schedule(max_retries=1, retry_delay=delay), fail_once, self.event()
             )
