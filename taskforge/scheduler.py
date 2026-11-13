@@ -19,12 +19,13 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
             raise ValueError("workers must be a positive integer")
         super().__init__(queue_capacity, priority_burst)
         self._workers: list[Thread] = []
+        self._timer: Thread | None = None
         pool_id = uuid4().hex[:8]
         try:
             for index in range(workers):
                 thread = Thread(
                     target=worker_loop,
-                    args=(self._take,),
+                    args=(self._take, self._finish),
                     name=f"taskforge-{pool_id}-{index}",
                     daemon=False,
                 )
@@ -41,13 +42,31 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
             raise TypeError("fn must be callable")
         return partial(fn, *args, **kwargs)
 
+    def _ensure_timer(self) -> None:
+        if self._timer is None:
+            timer = Thread(
+                target=self._watch_deadlines, name="taskforge-deadlines", daemon=False
+            )
+            timer.start()
+            self._timer = timer
+
+    def _watch_deadlines(self) -> None:
+        with self._changed:
+            while True:
+                self._expire_due()
+                timeout = self._deadline_timeout()
+                if timeout is None:
+                    self._timer = None
+                    return
+                self._changed.wait(timeout)
+
     def _take(self) -> WorkItem[Callable[[], Any]] | None:
         with self._changed:
             while True:
                 item = self._claim()
-                if item is not None or self._closed:
+                if item is not None or (self._closed and not self._pending):
                     return item
-                self._changed.wait()
+                self._changed.wait(self._retry_timeout())
 
     def shutdown(self, *, wait: bool = True, cancel_pending: bool = False) -> None:
         """Close admission and drain or cancel queued work. Optionally join workers."""
@@ -57,7 +76,10 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
         if wait:
             for thread in self._workers:
                 thread.join()
-            self._join_timer()
+            with self._changed:
+                timer = self._timer
+            if timer is not None:
+                timer.join()
 
     def __enter__(self) -> Self:
         return self

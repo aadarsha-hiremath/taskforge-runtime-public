@@ -25,6 +25,7 @@ class Job(Generic[T]):
         self._id = uuid4()
         self._changed = Condition()
         self._state = JobState.PENDING
+        self._attempts = 0
         self._cancel_pending: Callable[[UUID], bool] | None = cancel_pending
         self._value: T | None = None
         self._error: BaseException | None = None
@@ -32,6 +33,12 @@ class Job(Generic[T]):
     @property
     def id(self) -> UUID:
         return self._id
+
+    @property
+    def attempts(self) -> int:
+        """Number of claims, including the first attempt and uncertain dispatches."""
+        with self._changed:
+            return self._attempts
 
     @property
     def state(self) -> JobState:
@@ -67,8 +74,15 @@ class Job(Generic[T]):
         with self._changed:
             self._cancel_pending = None
             self._state = state
+            if state is JobState.RUNNING:
+                self._attempts += 1
             if state in (JobState.CANCELLED, JobState.EXPIRED):
                 self._changed.notify_all()
+
+    def _retry(self, cancel: Callable[[UUID], bool]) -> None:
+        with self._changed:
+            self._cancel_pending = cancel
+            self._state = JobState.PENDING
 
     def _complete(self, value: T) -> None:
         with self._changed:

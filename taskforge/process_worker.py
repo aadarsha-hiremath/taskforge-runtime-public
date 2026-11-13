@@ -15,6 +15,7 @@ __all__ = [
     "CODEC_ERROR",
     "READY",
     "TASK_ERROR",
+    "TASK_EXIT",
     "VALUE",
     "PipeEnd",
     "encode_call",
@@ -27,7 +28,7 @@ else:
     from multiprocessing.connection import Connection as PipeEnd
 
 READY = b"ready"
-VALUE, TASK_ERROR, CODEC_ERROR = b"V", b"E", b"S"
+VALUE, TASK_ERROR, TASK_EXIT, CODEC_ERROR = b"V", b"E", b"X", b"S"
 
 
 def encode_call(
@@ -62,7 +63,9 @@ def _execute(request: bytes) -> bytes:
     try:
         value = fn(*args, **kwargs)
     except BaseException as error:  # noqa: BLE001
-        return _failure(TASK_ERROR, error)
+        return _failure(
+            TASK_ERROR if isinstance(error, Exception) else TASK_EXIT, error
+        )
     try:
         return VALUE + pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
     except BaseException as error:  # noqa: BLE001

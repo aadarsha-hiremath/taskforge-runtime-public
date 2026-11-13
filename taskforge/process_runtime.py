@@ -17,24 +17,24 @@ from .errors import (
     SerializationError,
     WorkerLostError,
 )
-from .job import Job
 from .process_worker import (
     CODEC_ERROR,
     READY,
     TASK_ERROR,
+    TASK_EXIT,
     VALUE,
     PipeEnd,
     encode_call,
     process_worker,
 )
-from .scheduling import ScheduledPool
+from .scheduling import ScheduledPool, WorkItem
 
 
 @dataclass
 class _Worker:
     process: BaseProcess
     pipe: PipeEnd
-    job: Job[Any] | None = None
+    item: WorkItem[bytes] | None = None
 
 
 class ProcessRuntime(ScheduledPool[bytes]):
@@ -109,9 +109,12 @@ class ProcessRuntime(ScheduledPool[bytes]):
 
     def _lose(self, worker: _Worker, reason: str) -> None:
         worker.pipe.close()
-        if worker.job is not None:
-            worker.job._fail(WorkerLostError(f"worker {worker.process.pid}: {reason}"))
-            worker.job = None
+        if worker.item is not None:
+            self._finish(
+                worker.item,
+                error=WorkerLostError(f"worker {worker.process.pid}: {reason}"),
+            )
+            worker.item = None
 
     def _receive(self, worker: _Worker) -> None:
         try:
@@ -119,38 +122,40 @@ class ProcessRuntime(ScheduledPool[bytes]):
         except (EOFError, OSError) as error:
             self._lose(worker, f"connection lost ({type(error).__name__})")
             return
-        job = worker.job
-        if job is None or reply[:1] not in (VALUE, TASK_ERROR, CODEC_ERROR):
+        item = worker.item
+        if item is None or reply[:1] not in (VALUE, TASK_ERROR, TASK_EXIT, CODEC_ERROR):
             self._lose(worker, "invalid worker reply")
             return
         if reply[:1] == VALUE:
             try:
                 value = pickle.loads(reply[1:])
             except BaseException as error:  # noqa: BLE001
-                job._fail(
-                    SerializationError(
+                self._finish(
+                    item,
+                    error=SerializationError(
                         f"could not decode worker result ({type(error).__name__})"
-                    )
+                    ),
                 )
             else:
-                job._complete(value)
+                self._finish(item, value)
         else:
             detail = reply[1:].decode("utf-8")
-            job._fail(
-                RemoteTaskError(detail)
-                if reply[:1] == TASK_ERROR
-                else SerializationError(detail)
+            error_type = (
+                SerializationError if reply[:1] == CODEC_ERROR else RemoteTaskError
             )
-        worker.job = None
+            self._finish(
+                item, error=error_type(detail), retryable=reply[:1] == TASK_ERROR
+            )
+        worker.item = None
 
     def _dispatch(self, worker: _Worker) -> None:
         with self._changed:
             item = self._claim()
             if item is None:
-                if self._closed:
+                if self._closed and not self._pending:
                     worker.pipe.close()
                 return
-            worker.job = item.job
+            worker.item = item
         try:
             worker.pipe.send_bytes(item.payload)
         except (EOFError, OSError) as error:
@@ -159,8 +164,10 @@ class ProcessRuntime(ScheduledPool[bytes]):
     def _serve(self) -> None:
         try:
             while True:
+                with self._changed:
+                    self._expire_due()
                 for worker in self._workers:
-                    if worker.job is None and not worker.pipe.closed:
+                    if worker.item is None and not worker.pipe.closed:
                         self._dispatch(worker)
                 live = {w.pipe: w for w in self._workers if not w.pipe.closed}
                 if not live:
@@ -169,7 +176,16 @@ class ProcessRuntime(ScheduledPool[bytes]):
                 retiring = {
                     w.process.sentinel: w for w in self._workers if w.pipe.closed
                 }
-                ready = wait_connections([self._wake_read, *live, *retiring])
+                with self._changed:
+                    idle = any(worker.item is None for worker in live.values())
+                    delays = (
+                        self._deadline_timeout(),
+                        self._retry_timeout() if idle else None,
+                    )
+                    timeout = min(
+                        (delay for delay in delays if delay is not None), default=None
+                    )
+                ready = wait_connections([self._wake_read, *live, *retiring], timeout)
                 if self._wake_read in ready:
                     with self._changed:
                         self._wake_read.recv_bytes()
@@ -196,7 +212,6 @@ class ProcessRuntime(ScheduledPool[bytes]):
             self._cleanup()
 
     def _cleanup(self) -> None:
-        self._join_timer()
         self._wake_read.close()
         self._wake_write.close()
         for worker in self._workers:
