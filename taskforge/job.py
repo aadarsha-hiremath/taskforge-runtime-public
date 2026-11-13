@@ -4,7 +4,7 @@ from threading import Condition
 from typing import Generic, TypeVar, cast
 from uuid import UUID, uuid4
 
-from .errors import JobCancelledError
+from .errors import DeadlineExpiredError, JobCancelledError
 
 T = TypeVar("T")
 
@@ -15,6 +15,7 @@ class JobState(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    EXPIRED = "expired"
 
 
 class Job(Generic[T]):
@@ -54,6 +55,8 @@ class Job(Generic[T]):
                 raise TimeoutError(f"job {self._id} is still {self._state}")
             if self._state is JobState.CANCELLED:
                 raise JobCancelledError(f"job {self._id} was cancelled")
+            if self._state is JobState.EXPIRED:
+                raise DeadlineExpiredError(f"job {self._id} missed its start deadline")
             if self._error is not None:
                 raise self._error
             # COMPLETED includes tasks that legitimately returned None.
@@ -64,7 +67,7 @@ class Job(Generic[T]):
         with self._changed:
             self._cancel_pending = None
             self._state = state
-            if state is JobState.CANCELLED:
+            if state in (JobState.CANCELLED, JobState.EXPIRED):
                 self._changed.notify_all()
 
     def _complete(self, value: T) -> None:

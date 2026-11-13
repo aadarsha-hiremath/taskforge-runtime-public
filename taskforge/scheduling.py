@@ -5,7 +5,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from threading import Condition
+from math import isfinite
+from threading import TIMEOUT_MAX, Condition, Thread
+from time import monotonic
 from typing import Any, Generic, ParamSpec, TypeVar
 from uuid import UUID
 
@@ -21,10 +23,24 @@ T = TypeVar("T")
 class Schedule:
     priority: int = 0
     submit_timeout: float | None = None
+    start_within: float | None = None
 
     def __post_init__(self) -> None:
         if type(self.priority) is not int:
             raise ValueError("priority must be an integer")
+        if self.start_within is not None:
+            _validate_duration("start_within", self.start_within)
+
+
+def _validate_duration(name: str, value: float) -> None:
+    if (
+        type(value) not in (int, float)
+        or not 0 <= value <= TIMEOUT_MAX
+        or not isfinite(value)
+    ):
+        raise ValueError(
+            f"{name} must be a finite nonnegative duration up to {TIMEOUT_MAX} seconds"
+        )
 
 
 @dataclass(slots=True)
@@ -32,6 +48,7 @@ class WorkItem(Generic[Payload]):
     job: Job[Any]
     payload: Payload
     schedule: Schedule
+    deadline: float | None
 
 
 class ScheduledPool(ABC, Generic[Payload]):
@@ -46,6 +63,50 @@ class ScheduledPool(ABC, Generic[Payload]):
         self._changed = Condition()
         self._closed = False
         self._pending: dict[UUID, WorkItem[Payload]] = {}
+        self._timer: Thread | None = None
+
+    def _ensure_timer(self) -> None:
+        if self._timer is None or not self._timer.is_alive():
+            timer = Thread(
+                target=self._watch_deadlines, name="taskforge-deadlines", daemon=False
+            )
+            timer.start()
+            self._timer = timer
+
+    def _expire(self, now: float) -> None:
+        due = [
+            key
+            for key, item in self._pending.items()
+            if item.deadline is not None and item.deadline <= now
+        ]
+        if due:
+            for key in due:
+                self._pending.pop(key).job._leave_queue(JobState.EXPIRED)
+            self._signal()
+
+    def _watch_deadlines(self) -> None:
+        with self._changed:
+            while True:
+                now = monotonic()
+                self._expire(now)
+                deadline = min(
+                    (
+                        item.deadline
+                        for item in self._pending.values()
+                        if item.deadline is not None
+                    ),
+                    default=None,
+                )
+                if deadline is None:
+                    self._timer = None
+                    return
+                self._changed.wait(max(0, deadline - now))
+
+    def _join_timer(self) -> None:
+        with self._changed:
+            timer = self._timer
+        if timer is not None:
+            timer.join()
 
     @abstractmethod
     def _prepare(
@@ -96,12 +157,20 @@ class ScheduledPool(ABC, Generic[Payload]):
             if not ready:
                 raise QueueFullError("job queue is full")
             job = Job[T](self._cancel)
-            self._pending[job.id] = WorkItem(job, payload, schedule)
+            deadline = None
+            if schedule.start_within is not None:
+                if schedule.start_within == 0:
+                    job._leave_queue(JobState.EXPIRED)
+                    return job
+                self._ensure_timer()
+                deadline = monotonic() + schedule.start_within
+            self._pending[job.id] = WorkItem(job, payload, schedule, deadline)
             self._signal()
             return job
 
     def _claim(self) -> WorkItem[Payload] | None:
         """Called under the queue condition. Dict insertion order breaks ties."""
+        self._expire(monotonic())
         if not self._pending:
             return None
         oldest = next(iter(self._pending.values()))
@@ -118,6 +187,7 @@ class ScheduledPool(ABC, Generic[Payload]):
 
     def _cancel(self, job_id: UUID) -> bool:
         with self._changed:
+            self._expire(monotonic())
             item = self._pending.pop(job_id, None)
             if item is None:
                 return False
@@ -127,6 +197,7 @@ class ScheduledPool(ABC, Generic[Payload]):
 
     def _close(self, cancel_pending: bool) -> None:
         with self._changed:
+            self._expire(monotonic())
             changed = not self._closed or bool(cancel_pending and self._pending)
             self._closed = True
             if cancel_pending:

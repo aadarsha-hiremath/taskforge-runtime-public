@@ -196,6 +196,7 @@ class ProcessRuntime(ScheduledPool[bytes]):
             self._cleanup()
 
     def _cleanup(self) -> None:
+        self._join_timer()
         self._wake_read.close()
         self._wake_write.close()
         for worker in self._workers:

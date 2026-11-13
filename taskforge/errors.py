@@ -1,6 +1,10 @@
 """Exceptions raised by the runtime itself."""
 
 
+class DeadlineExpiredError(TimeoutError):
+    """The latest allowed claim time passed while the job was waiting."""
+
+
 class RuntimeClosedError(RuntimeError):
     """Submission was attempted after shutdown began."""
 

@@ -43,8 +43,11 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
 
     def _take(self) -> WorkItem[Callable[[], Any]] | None:
         with self._changed:
-            self._changed.wait_for(lambda: self._closed or bool(self._pending))
-            return self._claim()
+            while True:
+                item = self._claim()
+                if item is not None or self._closed:
+                    return item
+                self._changed.wait()
 
     def shutdown(self, *, wait: bool = True, cancel_pending: bool = False) -> None:
         """Close admission and drain or cancel queued work. Optionally join workers."""
@@ -54,6 +57,7 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
         if wait:
             for thread in self._workers:
                 thread.join()
+            self._join_timer()
 
     def __enter__(self) -> Self:
         return self

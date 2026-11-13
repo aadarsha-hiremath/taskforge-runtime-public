@@ -1,6 +1,7 @@
 """Public API for the TaskForge thread and process runtimes."""
 
 from .errors import (
+    DeadlineExpiredError,
     JobCancelledError,
     QueueFullError,
     RemoteTaskError,
@@ -14,6 +15,7 @@ from .scheduler import Runtime
 from .scheduling import Schedule
 
 __all__ = [
+    "DeadlineExpiredError",
     "Job",
     "JobCancelledError",
     "JobState",
