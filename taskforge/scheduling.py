@@ -30,6 +30,8 @@ class Schedule:
     def __post_init__(self) -> None:
         if type(self.priority) is not int:
             raise ValueError("priority must be an integer")
+        if self.submit_timeout is not None:
+            _validate_duration("submit_timeout", self.submit_timeout)
         if self.start_within is not None:
             _validate_duration("start_within", self.start_within)
         if type(self.max_retries) is not int or self.max_retries < 0:

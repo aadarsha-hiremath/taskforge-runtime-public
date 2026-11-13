@@ -5,7 +5,7 @@ import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.managers import SyncManager
-from threading import Event
+from threading import TIMEOUT_MAX, Event
 from typing import Any, ClassVar, cast
 from unittest.mock import patch
 
@@ -279,6 +279,30 @@ def always_fail() -> None:
 
 def signal_event(event: Event) -> None:
     event.set()
+
+
+class ScheduleValidationTests(unittest.TestCase):
+    def test_submit_timeout_rejects_invalid_durations(self) -> None:
+        for value in (
+            -1,
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+            TIMEOUT_MAX + 1,
+        ):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "submit_timeout"),
+            ):
+                Schedule(submit_timeout=value)
+
+    def test_submit_timeout_preserves_supported_durations(self) -> None:
+        self.assertIsNone(Schedule().submit_timeout)
+        for value in (None, 0, 0.25, 1, TIMEOUT_MAX):
+            with self.subTest(value=value):
+                self.assertEqual(Schedule(submit_timeout=value).submit_timeout, value)
 
 
 class ThreadSchedulingTests(SchedulingCases, unittest.TestCase):
