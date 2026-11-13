@@ -1,10 +1,11 @@
 from collections.abc import Callable
 from functools import partial
-from threading import Thread, current_thread
+from threading import Thread, current_thread, local
 from types import TracebackType
 from typing import Any, Self
 from uuid import uuid4
 
+from .errors import WorkerLostError
 from .observability import WorkerHealth, WorkerState
 from .scheduling import ScheduledPool, WorkItem
 from .worker import worker_loop
@@ -22,13 +23,16 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
             raise ValueError("workers must be a positive integer")
         super().__init__(queue_capacity, priority_burst)
         self._workers: list[Thread] = []
+        self._worker_context = local()
         self._timer: Thread | None = None
         pool_id = uuid4().hex[:8]
         try:
             for index in range(workers):
+                worker_id = f"taskforge-{pool_id}-{index}"
                 thread = Thread(
                     target=self._run_worker,
-                    name=f"taskforge-{pool_id}-{index}",
+                    args=(worker_id,),
+                    name=worker_id,
                     daemon=False,
                 )
                 with self._changed:
@@ -45,19 +49,32 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
             self.shutdown()
             raise
 
-    def _run_worker(self) -> None:
+    def _run_worker(self, worker_id: str) -> None:
+        self._worker_context.worker_id = worker_id
         expected = False
         try:
             worker_loop(self._take, self._finish)
             expected = True
+        except BaseException:  # noqa: BLE001
+            # The loop itself failed. Task exceptions are handled inside worker_loop.
+            # Never replay an assigned attempt whose effects are uncertain.
+            with self._changed:
+                item = getattr(self._worker_context, "item", None)
+                if item is not None and self._health[worker_id].job_id == item.job.id:
+                    self._finish(
+                        item,
+                        error=WorkerLostError(f"thread worker {worker_id} stopped"),
+                    )
         finally:
             with self._changed:
-                self._worker_exit(current_thread().name, expected)
-                if not expected and all(
+                self._worker_exit(worker_id, expected)
+                if all(
                     w.state in (WorkerState.EXITED, WorkerState.FAILED)
                     for w in self._health.values()
                 ):
-                    self._no_workers()
+                    if not expected:
+                        self._no_workers()
+                    self._stopped = True
 
     def _prepare(
         self, fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]
@@ -86,9 +103,11 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
 
     def _take(self) -> WorkItem[Callable[[], Any]] | None:
         with self._changed:
+            self._worker_context.item = None
             while True:
-                item = self._claim(current_thread().name)
+                item = self._claim(self._worker_context.worker_id)
                 if item is not None or (self._closed and not self._pending):
+                    self._worker_context.item = item
                     return item
                 self._changed.wait(self._retry_timeout())
 
@@ -115,4 +134,3 @@ class Runtime(ScheduledPool[Callable[[], Any]]):
         tb: TracebackType | None,
     ) -> None:
         self.shutdown()
-

@@ -247,6 +247,8 @@ class ProcessRuntime(ScheduledPool[_Request]):
         for worker in self._workers:
             worker.pipe.close()
             self._reap(worker)
+        with self._changed:
+            self._stopped = True
 
     def shutdown(
         self,

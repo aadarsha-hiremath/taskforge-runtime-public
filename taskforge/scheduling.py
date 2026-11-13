@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from .observability import RuntimeSnapshot, WorkerHealth, WorkerState
 Payload = TypeVar("Payload")
 P = ParamSpec("P")
 T = TypeVar("T")
+_log = logging.getLogger("taskforge.runtime")
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +78,7 @@ class ScheduledPool(ABC, Generic[Payload]):
         self._bypasses = 0
         self._changed = Condition()
         self._closed = False
+        self._stopped = False
         self._cancel_retries = False
         self._reserved = 0
         self._pending: dict[UUID, WorkItem[Payload]] = {}
@@ -90,10 +93,7 @@ class ScheduledPool(ABC, Generic[Payload]):
             return RuntimeSnapshot(
                 backend=self._backend,
                 closed=self._closed,
-                stopped=self._closed
-                and all(
-                    w.state in (WorkerState.EXITED, WorkerState.FAILED) for w in workers
-                ),
+                stopped=self._stopped,
                 accepted=self._accepted,
                 started=self._started,
                 attempts=self._attempts,
@@ -108,13 +108,44 @@ class ScheduledPool(ABC, Generic[Payload]):
                 workers=workers,
             )
 
-    def _leave_pending(self, job: Job[Any], state: JobState) -> None:
+    def _event(
+        self,
+        event: str,
+        job: Job[Any] | None = None,
+        *,
+        worker_id: str | None = None,
+        state: str | None = None,
+        deadline: float | None = None,
+    ) -> None:
+        if _log.isEnabledFor(logging.INFO):
+            try:
+                _log.info(
+                    event,
+                    extra={
+                        "event": event,
+                        "backend": self._backend,
+                        "worker_id": worker_id,
+                        "job_id": str(job.id) if job else None,
+                        "attempt": job.attempts if job else None,
+                        "state": job.state.value if job else state,
+                        "deadline": deadline,
+                    },
+                )
+            except Exception:  # noqa: BLE001, S110
+                # Application-owned formatting and handlers cannot decide job outcomes.
+                pass
+
+    def _leave_pending(
+        self, job: Job[Any], state: JobState, deadline: float | None = None
+    ) -> None:
         self._outcomes[state] += 1
         job._leave_queue(state)
+        self._event(state.value, job, deadline=deadline)
 
     def _fail_job(self, job: Job[Any], error: BaseException) -> None:
         self._outcomes[JobState.FAILED] += 1
         job._fail(error)
+        self._event("failed", job)
 
     def _no_workers(self) -> None:
         self._closed = True
@@ -129,7 +160,10 @@ class ScheduledPool(ABC, Generic[Payload]):
         self, worker_id: str, expected: bool, code: int | None = None
     ) -> None:
         state = WorkerState.EXITED if expected else WorkerState.FAILED
+        previous = self._health[worker_id].state
         self._health[worker_id] = WorkerHealth(worker_id, state, exit_code=code)
+        if previous is not state:
+            self._event(f"worker_{state.value}", worker_id=worker_id, state=state.value)
 
     def _ensure_timer(self) -> None:
         """Thread pools override this when deadlines need an independent timer."""
@@ -142,7 +176,8 @@ class ScheduledPool(ABC, Generic[Payload]):
         ]
         if due:
             for key in due:
-                self._leave_pending(self._pending.pop(key).job, JobState.EXPIRED)
+                item = self._pending.pop(key)
+                self._leave_pending(item.job, JobState.EXPIRED, item.deadline)
             self._signal()
 
     def _expire_due(self) -> None:
@@ -209,12 +244,15 @@ class ScheduledPool(ABC, Generic[Payload]):
             if schedule.start_within is not None:
                 if schedule.start_within == 0:
                     self._accepted += 1
-                    self._leave_pending(job, JobState.EXPIRED)
+                    deadline = monotonic()
+                    self._event("accepted", job, deadline=deadline)
+                    self._leave_pending(job, JobState.EXPIRED, deadline)
                     return job
                 self._ensure_timer()
                 deadline = monotonic() + schedule.start_within
             self._pending[job.id] = WorkItem(job, payload, schedule, deadline)
             self._accepted += 1
+            self._event("accepted", job, deadline=deadline)
             self._signal()
             return job
 
@@ -246,6 +284,7 @@ class ScheduledPool(ABC, Generic[Payload]):
         item.reserved = attempts <= item.schedule.max_retries
         if item.reserved:
             self._reserved += 1
+        self._event("claimed", item.job, worker_id=worker_id, deadline=item.deadline)
         self._changed.notify_all()
         return item
 
@@ -273,7 +312,7 @@ class ScheduledPool(ABC, Generic[Payload]):
                 if retryable and not self._cancel_retries:
                     now = monotonic()
                     if item.deadline is not None and item.deadline <= now:
-                        self._leave_pending(item.job, JobState.EXPIRED)
+                        self._leave_pending(item.job, JobState.EXPIRED, item.deadline)
                     else:
                         if item.deadline is not None:
                             try:
@@ -286,12 +325,19 @@ class ScheduledPool(ABC, Generic[Payload]):
                         item.job._retry(self._cancel)
                         self._pending[item.job.id] = item
                         self._retries += 1
+                        self._event(
+                            "retry_scheduled",
+                            item.job,
+                            worker_id=item.worker_id,
+                            deadline=item.deadline,
+                        )
                     self._signal()
                     return
                 self._changed.notify_all()
             if error is None:
                 self._outcomes[JobState.COMPLETED] += 1
                 item.job._complete(value)
+                self._event("completed", item.job, worker_id=item.worker_id)
             else:
                 self._fail_job(item.job, error)
 

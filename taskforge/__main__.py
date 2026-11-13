@@ -1,4 +1,6 @@
 import argparse
+import json
+from dataclasses import asdict
 from threading import current_thread
 
 from .demo import process_square
@@ -16,6 +18,11 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--queue-capacity", type=int, default=4)
     parser.add_argument("--backend", choices=("thread", "process"), default="thread")
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="print final pool statistics and worker health as JSON",
+    )
     args = parser.parse_args()
     if min(args.workers, args.queue_capacity) < 1:
         parser.error("workers and queue capacity must be positive")
@@ -28,6 +35,8 @@ def main() -> None:
         for number, job in jobs:
             square, worker = job.result()
             print(f"{job.id}  {job.state.value}  {number}^2 = {square}  ({worker})")
+    if args.stats:
+        print(json.dumps(asdict(runtime.snapshot())))
 
 
 if __name__ == "__main__":
