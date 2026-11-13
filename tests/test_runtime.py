@@ -280,6 +280,11 @@ class RuntimeTests(unittest.TestCase):
                 self.assertIsNone(job.result(LIMIT))
                 self.assertIs(job.state, JobState.COMPLETED)
         self.assertEqual(calls, [] if cancel_first else [1])
+        snapshot = pool.snapshot()
+        self.assertEqual(snapshot.accepted, 1)
+        self.assertEqual(snapshot.cancelled, int(cancel_first))
+        self.assertEqual(snapshot.started, int(not cancel_first))
+        self.assertEqual(snapshot.completed, snapshot.started)
 
     def test_concurrent_producers_no_lost_or_duplicate_work(self) -> None:
         runtime = self.pool(workers=3, capacity=2)
