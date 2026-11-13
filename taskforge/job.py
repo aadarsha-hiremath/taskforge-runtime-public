@@ -75,6 +75,7 @@ class Job(Generic[T]):
 
     def _fail(self, error: BaseException) -> None:
         with self._changed:
+            self._cancel_pending = None  # The last process can die with jobs queued.
             self._error = error
             self._state = JobState.FAILED
             self._changed.notify_all()

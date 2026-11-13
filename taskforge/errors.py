@@ -11,3 +11,15 @@ class QueueFullError(TimeoutError):
 
 class JobCancelledError(Exception):
     """The job was cancelled before a worker claimed it."""
+
+
+class SerializationError(ValueError):
+    """A process task or its result could not cross the serialization boundary."""
+
+
+class RemoteTaskError(Exception):
+    """The worker raised an exception. Its formatted traceback is the message."""
+
+
+class WorkerLostError(RuntimeError):
+    """A worker connection was lost or no surviving worker could run the job."""
