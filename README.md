@@ -92,4 +92,4 @@ The [Phase 5 verification record](verification-phase-5.md) contains the baseline
 
 TaskForge runs trusted local Python code. Pickle can execute code during reconstruction. A start deadline governs the scheduler claim, and a result timeout governs one reader. A running callable can keep a joining shutdown waiting indefinitely. Retries are opt-in and suit idempotent operations. Jobs and results are in-memory, with no durable recovery or automatic worker replacement.
 
-This checkout contains no project license or declared license grant. The repository owner should choose the license and its metadata before a public source release. The audited package version remains 0.4.0.
+TaskForge Runtime is licensed under the [MIT License](LICENSE). The audited package version remains 0.4.0.
