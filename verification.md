@@ -5,7 +5,7 @@ All checks ran locally on Windows. Commands below ran in PowerShell from the rep
 ## Environment
 
 ```powershell
-& 'C:/Users/MSILAPTOP/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -m venv .venv
+& "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe" -m venv .venv
 .\.venv\Scripts\python.exe -m pip install ruff mypy setuptools wheel
 .\.venv\Scripts\python.exe -m pip install uv
 $env:UV_CACHE_DIR = '.venv/uv-cache'
@@ -50,5 +50,5 @@ During development, Ruff flagged the broad worker exception handler and test sty
 From the parent directory, the installed console entry point also printed three completed jobs with squares 4, 9 and 16 and exited successfully:
 
 ```powershell
-& 'C:/Users/MSILAPTOP/Documents/GitHub/taskforge-runtime/.venv/Scripts/taskforge.exe' --workers 2 --queue-capacity 1 2 3 4
+.\taskforge-runtime\.venv\Scripts\taskforge.exe --workers 2 --queue-capacity 1 2 3 4
 ```

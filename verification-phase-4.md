@@ -16,7 +16,7 @@ All requested interpreters were available. There were no skips. The durations ar
 
 ```powershell
 .\.venv\interpreters\cpython-3.11.18-windows-x86_64-none\python.exe -c "import subprocess, sys; print(sys.version, flush=True); subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-q'], check=True, timeout=150)"
-& 'C:/Users/MSILAPTOP/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe' -c "import subprocess, sys; print(sys.version, flush=True); subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-q'], check=True, timeout=150)"
+& "$HOME/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe" -c "import subprocess, sys; print(sys.version, flush=True); subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-q'], check=True, timeout=150)"
 .\.venv\Scripts\python.exe -c "import subprocess, sys; print(sys.version, flush=True); subprocess.run([sys.executable, '-m', 'unittest', 'discover', '-q'], check=True, timeout=150)"
 ```
 
