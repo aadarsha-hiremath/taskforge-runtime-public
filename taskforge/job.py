@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from enum import StrEnum
 from threading import Condition
+from types import TracebackType
 from typing import Generic, TypeVar, cast
 from uuid import UUID, uuid4
 
@@ -29,6 +30,7 @@ class Job(Generic[T]):
         self._cancel_pending: Callable[[UUID], bool] | None = cancel_pending
         self._value: T | None = None
         self._error: BaseException | None = None
+        self._error_traceback: TracebackType | None = None
 
     @property
     def id(self) -> UUID:
@@ -65,7 +67,7 @@ class Job(Generic[T]):
             if self._state is JobState.EXPIRED:
                 raise DeadlineExpiredError(f"job {self._id} missed its start deadline")
             if self._error is not None:
-                raise self._error
+                raise BaseException.with_traceback(self._error, self._error_traceback)
             # COMPLETED includes tasks that legitimately returned None.
             return cast(T, self._value)
 
@@ -94,5 +96,6 @@ class Job(Generic[T]):
         with self._changed:
             self._cancel_pending = None  # The last process can die with jobs queued.
             self._error = error
+            self._error_traceback = error.__traceback__
             self._state = JobState.FAILED
             self._changed.notify_all()

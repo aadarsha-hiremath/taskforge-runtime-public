@@ -3,6 +3,7 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from threading import Barrier, Condition, Event, Lock, Thread, current_thread
+from traceback import extract_tb
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID
@@ -143,6 +144,18 @@ class RuntimeTests(unittest.TestCase):
             self.assertIs(job.state, JobState.FAILED)
             self.assertFalse(job.cancel())
         self.assertEqual(runtime.submit(str, 42).result(LIMIT), "42")
+
+    def test_repeated_result_reads_preserve_original_traceback_depth(self) -> None:
+        job = self.pool().submit(int, "invalid")
+        frames = []
+        for _ in range(5):
+            try:
+                job.result(LIMIT)
+            except ValueError as error:
+                frames.append([frame.name for frame in extract_tb(error.__traceback__)])
+        self.assertEqual(len(frames), 5)
+        self.assertIn("worker_loop", frames[0])
+        self.assertEqual(frames, [frames[0]] * 5)
 
     def test_producer_waits_until_worker_claims_a_job(self) -> None:
         runtime = self.pool(capacity=1)
