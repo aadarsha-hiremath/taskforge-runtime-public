@@ -96,6 +96,9 @@ class Job(Generic[T]):
         with self._changed:
             self._cancel_pending = None  # The last process can die with jobs queued.
             self._error = error
-            self._error_traceback = error.__traceback__
+            # Read the native traceback without invoking task-defined attribute hooks.
+            self._error_traceback = BaseException.__dict__["__traceback__"].__get__(
+                error, type(error)
+            )
             self._state = JobState.FAILED
             self._changed.notify_all()

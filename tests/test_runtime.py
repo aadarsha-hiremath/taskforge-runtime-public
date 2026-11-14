@@ -157,6 +157,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("worker_loop", frames[0])
         self.assertEqual(frames, [frames[0]] * 5)
 
+    def test_failure_publication_bypasses_task_exception_attribute_hooks(self) -> None:
+        class TaskError(Exception):
+            def __getattribute__(self, name: str) -> Any:
+                if name == "__traceback__":
+                    raise AssertionError("exception hook ran during publication")
+                return super().__getattribute__(name)
+
+        error = TaskError()
+
+        def task() -> None:
+            raise error
+
+        pool = self.pool()
+        job = pool.submit(task)
+        try:
+            job.result(LIMIT)
+        except TaskError as caught:
+            self.assertIs(caught, error)
+        else:
+            self.fail("expected the original task exception")
+        self.assertEqual(job.state, JobState.FAILED)
+        self.assertEqual(pool.submit(int, 7).result(LIMIT), 7)
+
     def test_producer_waits_until_worker_claims_a_job(self) -> None:
         runtime = self.pool(capacity=1)
         release, _ = self.occupy_worker(runtime)
