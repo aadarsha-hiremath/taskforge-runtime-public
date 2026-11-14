@@ -189,6 +189,30 @@ class SchedulingCases:
                 job.result(LIMIT)
             assert job.attempts == retries + 1 and job.state is JobState.FAILED
 
+    def test_bounded_retry_burst_with_result_readers(self) -> None:
+        pool = self.pool(2, capacity=3)
+        jobs = [
+            pool.submit_scheduled(
+                Schedule(max_retries=1, retry_delay=0.001, submit_timeout=LIMIT),
+                fail_once,
+                self.event(),
+            )
+            for _ in range(12)
+        ]
+        with ThreadPoolExecutor(4) as readers:
+            futures = [
+                readers.submit(job.result, LIMIT) for job in jobs for _ in range(2)
+            ]
+            assert [future.result(LIMIT) for future in futures] == [42] * 24
+        view = pool.snapshot()
+        assert (view.accepted, view.started, view.completed) == (12, 12, 12)
+        assert (view.attempts, view.retries_scheduled, view.failed, view.reserved) == (
+            24,
+            12,
+            0,
+            0,
+        )
+
     def test_long_backoff_drains_on_clock_advance(self) -> None:
         pool = self.pool(capacity=1)
         with patch("taskforge.scheduling.monotonic", return_value=10.0) as clock:
