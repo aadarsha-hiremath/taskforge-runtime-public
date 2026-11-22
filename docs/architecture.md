@@ -64,7 +64,7 @@ One parent controller waits on worker pipes and a wake-up pipe. Each worker has 
 
 | Event | Observable outcome |
 | --- | --- |
-| Task raises, including `SystemExit` | After any eligible retries, the job fails with `RemoteTaskError` containing the child traceback, exception type and message. The worker can accept another job. |
+| Task raises, including `SystemExit` | After any eligible retries, the job fails with `RemoteTaskError`. It includes the child traceback when formatting succeeds and the exception type when formatting fails. The worker can accept another job. |
 | Task reconstruction, result encoding or parent result decoding fails | The job fails with `SerializationError`. The worker remains available. |
 | Worker exits before the controller receives a complete reply | Its assigned job fails with `WorkerLostError`. Side effects may already have occurred. TaskForge never replays a lost worker's assigned job. A complete reply received before EOF is retained. |
 | An idle worker exits | The controller detects EOF even without a new submission. Surviving workers continue serving the queue at reduced capacity. |

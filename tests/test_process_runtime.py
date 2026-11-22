@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.context import SpawnProcess
 from multiprocessing.managers import SyncManager
 from threading import Event
+from typing import Any
 from unittest.mock import patch
 
 from taskforge import (
@@ -15,6 +16,7 @@ from taskforge import (
     QueueFullError,
     RemoteTaskError,
     RuntimeClosedError,
+    Schedule,
     SerializationError,
     WorkerLostError,
 )
@@ -52,6 +54,26 @@ def fail_task() -> None:
         pass
 
     raise LocalError("specific remote failure")
+
+
+class BrokenTracebackError(Exception):
+    def __getattribute__(self, name: str) -> Any:
+        if name == "__traceback__":
+            raise RuntimeError("task exception does not expose its traceback")
+        return super().__getattribute__(name)
+
+
+def fail_without_traceback() -> None:
+    raise BrokenTracebackError("task failure")
+
+
+class BrokenResult:
+    def __reduce__(self) -> tuple[object, tuple[()]]:
+        raise BrokenTracebackError("result encoding failure")
+
+
+def broken_result() -> BrokenResult:
+    return BrokenResult()
 
 
 def exit_task() -> None:
@@ -203,6 +225,70 @@ class ProcessTests(unittest.TestCase):
                 job.result(LIMIT)
             self.assertIs(job.state, JobState.FAILED)
         self.assertEqual(pool.submit(os.getpid).result(LIMIT), pid)
+
+    def test_unformattable_task_failure_preserves_worker_and_retries(self) -> None:
+        before = {child.pid for child in mp.active_children()}
+        pool = self.pool()
+        pid = pool.submit(os.getpid).result(LIMIT)
+        failed = pool.submit_scheduled(Schedule(max_retries=1), fail_without_traceback)
+        with self.assertRaisesRegex(RemoteTaskError, "BrokenTracebackError"):
+            failed.result(LIMIT)
+        self.assertIs(failed.state, JobState.FAILED)
+        self.assertEqual(failed.attempts, 2)
+        self.assertEqual(pool.submit(os.getpid).result(LIMIT), pid)
+        view = pool.snapshot()
+        self.assertEqual(
+            (view.completed, view.failed, view.retries_scheduled), (2, 1, 1)
+        )
+        self.assertEqual(
+            (view.attempts, view.reserved, view.available_workers), (4, 0, 1)
+        )
+        pool.shutdown(timeout=LIMIT)
+        self.assertEqual({child.pid for child in mp.active_children()}, before)
+
+    def test_unformattable_serialization_failure_is_terminal_with_two_workers(
+        self,
+    ) -> None:
+        before = {child.pid for child in mp.active_children()}
+        pool = self.pool(2)
+        initial_workers = tuple(worker.worker_id for worker in pool.snapshot().workers)
+        failed = pool.submit_scheduled(Schedule(max_retries=1), broken_result)
+        with self.assertRaisesRegex(SerializationError, "BrokenTracebackError"):
+            failed.result(LIMIT)
+        self.assertIs(failed.state, JobState.FAILED)
+        self.assertEqual(failed.attempts, 1)
+        gates = [self.gate(), self.gate()]
+        jobs = [pool.submit(gated_task, *gate) for gate in gates]
+        try:
+            self.assertTrue(all(started.wait(LIMIT) for started, _ in gates))
+            self.assertEqual(pool.snapshot().retries_scheduled, 0)
+        finally:
+            for _, release in gates:
+                release.set()
+        self.assertCountEqual([str(job.result(LIMIT)) for job in jobs], initial_workers)
+        pool.shutdown(timeout=LIMIT)
+        self.assertEqual({child.pid for child in mp.active_children()}, before)
+
+    def test_dispatch_broken_pipe_fails_job_without_replay(self) -> None:
+        before = {child.pid for child in mp.active_children()}
+        pool = self.pool(2)
+        failed_pipe = pool._workers[0].pipe
+        survivor = pool._workers[1].worker_id
+        send_bytes = PipeEnd.send_bytes
+
+        def send(pipe: PipeEnd, data: bytes, *args: Any, **kwargs: Any) -> None:
+            if pipe is failed_pipe:
+                raise BrokenPipeError("simulated dispatch failure")
+            send_bytes(pipe, data, *args, **kwargs)
+
+        with patch.object(PipeEnd, "send_bytes", send):
+            job = pool.submit_scheduled(Schedule(max_retries=1), os.getpid)
+            with self.assertRaisesRegex(WorkerLostError, "dispatch failed"):
+                job.result(LIMIT)
+            self.assertEqual(job.attempts, 1)
+            self.assertEqual(str(pool.submit(os.getpid).result(LIMIT)), survivor)
+        pool.shutdown(timeout=LIMIT)
+        self.assertEqual({child.pid for child in mp.active_children()}, before)
 
     def test_crash_fails_assigned_job_survivor_drains_queue(self) -> None:
         pool = self.pool(2)

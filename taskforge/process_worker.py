@@ -50,9 +50,18 @@ def encode_call(
 
 
 def _failure(tag: bytes, error: BaseException) -> bytes:
-    return tag + "".join(traceback.format_exception(error)).encode(
-        "utf-8", "backslashreplace"
-    )
+    try:
+        detail = "".join(traceback.format_exception(error))
+    except BaseException:  # noqa: BLE001
+        # Formatting can invoke task-defined hooks, including ones that raise
+        # control-flow exceptions. Read the type name without invoking them.
+        name = type.__dict__["__qualname__"].__get__(type(error))
+        return (
+            tag
+            + str.encode(name, "utf-8", "backslashreplace")
+            + b": traceback unavailable"
+        )
+    return tag + detail.encode("utf-8", "backslashreplace")
 
 
 def _execute(request: bytes) -> bytes:
