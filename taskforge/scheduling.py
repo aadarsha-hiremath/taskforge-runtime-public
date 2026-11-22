@@ -263,14 +263,21 @@ class ScheduledPool(ABC, Generic[Payload]):
     def _claim(self, worker_id: str) -> WorkItem[Payload] | None:
         """Called under the queue condition. Dict insertion order breaks ties."""
         now = monotonic()
-        self._expire(now)
-        eligible = [item for item in self._pending.values() if item.ready_at <= now]
-        if not eligible:
-            return None
-        oldest = eligible[0]
-        item = oldest
-        if self._bypasses < self._priority_burst:
-            item = max(eligible, key=lambda entry: entry.schedule.priority)
+        while True:
+            self._expire(now)
+            eligible = [item for item in self._pending.values() if item.ready_at <= now]
+            if not eligible:
+                return None
+            oldest = eligible[0]
+            item = oldest
+            if self._bypasses < self._priority_burst:
+                item = max(eligible, key=lambda entry: entry.schedule.priority)
+            if item.deadline is None:
+                break
+            now = monotonic()
+            if now < item.deadline:
+                break
+            # Expire and reselect before consuming a bypass or reserving capacity.
         self._bypasses = self._bypasses + 1 if item is not oldest else 0
         del self._pending[item.job.id]
         item.job._leave_queue(JobState.RUNNING)

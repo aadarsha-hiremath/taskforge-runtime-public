@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from multiprocessing.context import SpawnProcess
 from multiprocessing.managers import SyncManager
 from threading import Event
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from taskforge import (
@@ -15,9 +17,11 @@ from taskforge import (
     QueueFullError,
     RemoteTaskError,
     RuntimeClosedError,
+    Schedule,
     SerializationError,
     WorkerLostError,
 )
+from taskforge.process_runtime import _connection_timeout
 from taskforge.process_worker import PipeEnd
 from tests.test_runtime import observe_wait
 
@@ -52,6 +56,26 @@ def fail_task() -> None:
         pass
 
     raise LocalError("specific remote failure")
+
+
+class BrokenTracebackError(Exception):
+    def __getattribute__(self, name: str) -> Any:
+        if name == "__traceback__":
+            raise RuntimeError("task exception does not expose its traceback")
+        return super().__getattribute__(name)
+
+
+def fail_without_traceback() -> None:
+    raise BrokenTracebackError("task failure")
+
+
+class BrokenResult:
+    def __reduce__(self) -> tuple[object, tuple[()]]:
+        raise BrokenTracebackError("result encoding failure")
+
+
+def broken_result() -> BrokenResult:
+    return BrokenResult()
 
 
 def exit_task() -> None:
@@ -204,6 +228,70 @@ class ProcessTests(unittest.TestCase):
             self.assertIs(job.state, JobState.FAILED)
         self.assertEqual(pool.submit(os.getpid).result(LIMIT), pid)
 
+    def test_unformattable_task_failure_preserves_worker_and_retries(self) -> None:
+        before = {child.pid for child in mp.active_children()}
+        pool = self.pool()
+        pid = pool.submit(os.getpid).result(LIMIT)
+        failed = pool.submit_scheduled(Schedule(max_retries=1), fail_without_traceback)
+        with self.assertRaisesRegex(RemoteTaskError, "BrokenTracebackError"):
+            failed.result(LIMIT)
+        self.assertIs(failed.state, JobState.FAILED)
+        self.assertEqual(failed.attempts, 2)
+        self.assertEqual(pool.submit(os.getpid).result(LIMIT), pid)
+        view = pool.snapshot()
+        self.assertEqual(
+            (view.completed, view.failed, view.retries_scheduled), (2, 1, 1)
+        )
+        self.assertEqual(
+            (view.attempts, view.reserved, view.available_workers), (4, 0, 1)
+        )
+        pool.shutdown(timeout=LIMIT)
+        self.assertEqual({child.pid for child in mp.active_children()}, before)
+
+    def test_unformattable_serialization_failure_is_terminal_with_two_workers(
+        self,
+    ) -> None:
+        before = {child.pid for child in mp.active_children()}
+        pool = self.pool(2)
+        initial_workers = tuple(worker.worker_id for worker in pool.snapshot().workers)
+        failed = pool.submit_scheduled(Schedule(max_retries=1), broken_result)
+        with self.assertRaisesRegex(SerializationError, "BrokenTracebackError"):
+            failed.result(LIMIT)
+        self.assertIs(failed.state, JobState.FAILED)
+        self.assertEqual(failed.attempts, 1)
+        gates = [self.gate(), self.gate()]
+        jobs = [pool.submit(gated_task, *gate) for gate in gates]
+        try:
+            self.assertTrue(all(started.wait(LIMIT) for started, _ in gates))
+            self.assertEqual(pool.snapshot().retries_scheduled, 0)
+        finally:
+            for _, release in gates:
+                release.set()
+        self.assertCountEqual([str(job.result(LIMIT)) for job in jobs], initial_workers)
+        pool.shutdown(timeout=LIMIT)
+        self.assertEqual({child.pid for child in mp.active_children()}, before)
+
+    def test_dispatch_broken_pipe_fails_job_without_replay(self) -> None:
+        before = {child.pid for child in mp.active_children()}
+        pool = self.pool(2)
+        failed_pipe = pool._workers[0].pipe
+        survivor = pool._workers[1].worker_id
+        send_bytes = PipeEnd.send_bytes
+
+        def send(pipe: PipeEnd, data: bytes, *args: Any, **kwargs: Any) -> None:
+            if pipe is failed_pipe:
+                raise BrokenPipeError("simulated dispatch failure")
+            send_bytes(pipe, data, *args, **kwargs)
+
+        with patch.object(PipeEnd, "send_bytes", send):
+            job = pool.submit_scheduled(Schedule(max_retries=1), os.getpid)
+            with self.assertRaisesRegex(WorkerLostError, "dispatch failed"):
+                job.result(LIMIT)
+            self.assertEqual(job.attempts, 1)
+            self.assertEqual(str(pool.submit(os.getpid).result(LIMIT)), survivor)
+        pool.shutdown(timeout=LIMIT)
+        self.assertEqual({child.pid for child in mp.active_children()}, before)
+
     def test_crash_fails_assigned_job_survivor_drains_queue(self) -> None:
         pool = self.pool(2)
         start1, release1 = self.gate()
@@ -295,6 +383,82 @@ class ProcessTests(unittest.TestCase):
         ):
             ProcessRuntime(2, startup_timeout=0.1)
         self.assertEqual({child.pid for child in mp.active_children()}, before)
+
+    def test_long_startup_wait_rechecks_the_original_deadline(self) -> None:
+        poll = PipeEnd.poll
+        timeouts: list[float] = []
+        with patch("taskforge.process_runtime.monotonic", return_value=100.0) as clock:
+
+            def poll_after_first_slice(pipe: PipeEnd, timeout: float = 0) -> bool:
+                timeouts.append(timeout)
+                if len(timeouts) == 1:
+                    clock.return_value = 86_500.0
+                    return False
+                return poll(pipe, min(timeout, LIMIT))
+
+            with (
+                patch.object(PipeEnd, "poll", poll_after_first_slice),
+                patch(
+                    "taskforge.process_runtime.sys", SimpleNamespace(platform="linux")
+                ),
+            ):
+                pool = ProcessRuntime(1, startup_timeout=3_000_000)
+            try:
+                self.assertEqual(timeouts, [86_400, 86_400])
+                self.assertGreater(pool.submit(os.getpid).result(LIMIT), 0)
+            finally:
+                pool.shutdown(timeout=LIMIT)
+
+    def test_long_shutdown_timeout_joins_in_bounded_slices(self) -> None:
+        before = {child.pid for child in mp.active_children()}
+        pool = self.pool()
+        started, release = self.gate()
+        job = pool.submit(gated_task, started, release)
+        self.assertTrue(started.wait(LIMIT))
+        join = pool._controller.join
+        timeouts: list[float | None] = []
+        with patch("taskforge.process_runtime.monotonic", return_value=100.0) as clock:
+
+            def join_after_first_slice(timeout: float | None = None) -> None:
+                timeouts.append(timeout)
+                if len(timeouts) == 1:
+                    clock.return_value = 86_500.0
+                    return
+                release.set()
+                join(LIMIT)
+
+            with patch.object(pool._controller, "join", join_after_first_slice):
+                try:
+                    pool.shutdown(timeout=86_402)
+                finally:
+                    release.set()
+        self.assertEqual(timeouts, [86_400, 2])
+        self.assertGreater(job.result(LIMIT), 0)
+        self.assertTrue(pool.snapshot().stopped)
+        self.assertEqual({child.pid for child in mp.active_children()}, before)
+
+    def test_connection_timeout_boundaries_and_fractional_rounding(self) -> None:
+        linux = [0.0, 0.0, 0.0001, 0.0105, 60.0, 86_400.0, 86_400.0]
+        windows = [0.0, 0.0, 0.001, 0.011, 60.0, 86_400.0, 86_400.0]
+        inputs = [-1.0, 0.0, 0.0001, 0.0105, 60.0, 86_400.0, 3_000_000.0]
+        for platform, expected in (("linux", linux), ("win32", windows)):
+            with (
+                self.subTest(platform=platform),
+                patch(
+                    "taskforge.process_runtime.sys", SimpleNamespace(platform=platform)
+                ),
+            ):
+                self.assertEqual(list(map(_connection_timeout, inputs)), expected)
+
+    def test_shutdown_rejects_nonfinite_timeouts_before_closing(self) -> None:
+        pool = self.pool()
+        for timeout in (float("nan"), float("inf")):
+            with (
+                self.subTest(timeout=timeout),
+                self.assertRaisesRegex(ValueError, "shutdown timeout"),
+            ):
+                pool.shutdown(timeout=timeout)
+        self.assertGreater(pool.submit(os.getpid).result(LIMIT), 0)
 
     def test_worker_claim_releases_blocked_submitter(self) -> None:
         pool = self.pool(capacity=1)

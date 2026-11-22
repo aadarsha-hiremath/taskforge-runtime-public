@@ -31,6 +31,17 @@ from .process_worker import (
 )
 from .scheduling import ScheduledPool, WorkItem
 
+# Connection waits can use signed 32-bit milliseconds on POSIX and Windows.
+# Cap each OS wait well below that limit, keeping the original logical deadline.
+_MAX_WAIT_SECONDS = 86_400.0
+
+
+def _connection_timeout(remaining: float) -> float:
+    timeout = max(0.0, min(remaining, _MAX_WAIT_SECONDS))
+    if sys.platform == "win32":
+        return ceil(timeout * 1000) / 1000
+    return timeout
+
 
 @dataclass(slots=True)
 class _Request:
@@ -93,8 +104,9 @@ class ProcessRuntime(ScheduledPool[_Request]):
                 self._workers.append(_Worker(process, parent, worker_id))
                 self._health[worker_id] = WorkerHealth(worker_id, WorkerState.IDLE)
             for worker in self._workers:
-                if not worker.pipe.poll(max(0, deadline - monotonic())):
-                    raise TimeoutError("process startup handshake timed out")
+                while not worker.pipe.poll(_connection_timeout(deadline - monotonic())):
+                    if monotonic() >= deadline:
+                        raise TimeoutError("process startup handshake timed out")
                 try:
                     handshake = worker.pipe.recv_bytes()
                 except (EOFError, OSError) as error:
@@ -207,11 +219,10 @@ class ProcessRuntime(ScheduledPool[_Request]):
                     timeout = min(
                         (delay for delay in delays if delay is not None), default=None
                     )
-                    # Older Windows multiprocessing converts seconds to a signed
-                    # millisecond wait. Recompute long deadlines after one day.
-                    if sys.platform == "win32" and timeout is not None:
-                        timeout = ceil(min(timeout, 86400.0) * 1000) / 1000
-                ready = wait_connections([self._wake_read, *live, *retiring], timeout)
+                ready = wait_connections(
+                    [self._wake_read, *live, *retiring],
+                    None if timeout is None else _connection_timeout(timeout),
+                )
                 if self._wake_read in ready:
                     with self._changed:
                         self._wake_read.recv_bytes()
@@ -259,11 +270,20 @@ class ProcessRuntime(ScheduledPool[_Request]):
     ) -> None:
         if wait and current_thread() is self._controller:
             raise RuntimeError("the controller cannot join itself")
+        if wait and timeout is not None and not isfinite(timeout):
+            raise ValueError("shutdown timeout must be finite or None")
         self._close(cancel_pending)
-        if wait:
-            self._controller.join(timeout)
-            if self._controller.is_alive():
+        if not wait:
+            return
+        if timeout is None:
+            self._controller.join()
+            return
+        deadline = monotonic() + timeout
+        while self._controller.is_alive():
+            remaining = deadline - monotonic()
+            if remaining <= 0:
                 raise TimeoutError("process runtime is still shutting down")
+            self._controller.join(min(remaining, _MAX_WAIT_SECONDS))
 
     def __enter__(self) -> Self:
         return self

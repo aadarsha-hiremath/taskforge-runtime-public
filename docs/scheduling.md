@@ -9,7 +9,7 @@ Use `submit_scheduled(schedule, fn, *args, **kwargs)` on either backend. The fir
 | `job.result(timeout=seconds)` | Bounds this caller's wait for the final outcome. A timeout leaves execution and retry policy intact. |
 | `Schedule(max_retries=n, retry_delay=seconds)` | Allows at most `1 + n` attempts. After a retryable failure, the next attempt becomes eligible after a fixed delay measured from failure handling. Zero makes it eligible immediately. |
 
-Deadlines govern the scheduler's claim under its lock. OS scheduling, pipe transfer and argument reconstruction can delay entry into the callable after a timely claim. A running attempt can finish after its deadline. If it needs another attempt and its deadline has passed, the job expires. Expiration frees capacity and wakes result readers and submitters even when all workers are occupied.
+Deadlines govern the scheduler's claim under its lock. The scheduler checks the selected attempt's deadline again before committing the claim. If the deadline has arrived, it expires the job and selects again without consuming a priority bypass. OS scheduling, pipe transfer and argument reconstruction can delay entry into the callable after a timely claim. A running attempt can finish after its deadline. If it needs another attempt and its deadline has passed, the job expires. Expiration frees capacity and wakes result readers and submitters even when all workers are occupied.
 
 ### Priority and fairness
 

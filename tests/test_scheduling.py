@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import builtins
 import multiprocessing as mp
 import os
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from multiprocessing.connection import wait as wait_connections
 from multiprocessing.managers import SyncManager
 from threading import TIMEOUT_MAX, Event
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 from unittest.mock import patch
 
@@ -22,6 +25,7 @@ from taskforge import (
     SerializationError,
     WorkerLostError,
 )
+from taskforge.scheduling import WorkItem
 from tests.test_process_runtime import (
     LIMIT,
     bad_result,
@@ -161,6 +165,89 @@ class SchedulingCases:
             with self.case.assertRaises(DeadlineExpiredError):
                 loser.result(LIMIT)
             assert loser.attempts == 0 and not loser_ran.is_set()
+
+    def test_deadline_rechecked_after_priority_selection(self) -> None:
+        pool = self.pool(capacity=3, burst=1)
+        release = self.occupy(pool)
+        selected, resume = Event(), Event()
+        ran = self.event()
+        with patch("taskforge.scheduling.monotonic", return_value=10.0) as clock:
+            oldest = pool.submit_scheduled(Schedule(priority=0), next_sequence)
+            expiring = pool.submit_scheduled(
+                Schedule(priority=100, start_within=1, max_retries=1), signal_event, ran
+            )
+            next_high = pool.submit_scheduled(Schedule(priority=10), next_sequence)
+
+            def choose(*args: Any, **kwargs: Any) -> Any:
+                winner = builtins.max(*args, **kwargs)
+                if isinstance(winner, WorkItem) and winner.job is expiring:
+                    selected.set()
+                    assert resume.wait(LIMIT)
+                    clock.return_value = 11.0
+                return winner
+
+            cancelling, closing = Event(), Event()
+
+            def cancel() -> bool:
+                cancelling.set()
+                return expiring.cancel()
+
+            def shutdown() -> None:
+                closing.set()
+                pool.shutdown(wait=False)
+
+            with (
+                patch("taskforge.scheduling.max", choose, create=True),
+                ThreadPoolExecutor(2) as callers,
+            ):
+                try:
+                    release.set()
+                    assert selected.wait(LIMIT)
+                    cancellation = callers.submit(cancel)
+                    closure = callers.submit(shutdown)
+                    assert cancelling.wait(LIMIT) and closing.wait(LIMIT)
+                finally:
+                    resume.set()
+                with self.case.assertRaises(DeadlineExpiredError):
+                    expiring.result(LIMIT)
+                assert not cancellation.result(LIMIT)
+                closure.result(LIMIT)
+                # The expired selection doesn't consume the one priority bypass.
+                assert next_high.result(LIMIT) < oldest.result(LIMIT)
+        view = pool.snapshot()
+        assert (view.accepted, view.completed, view.expired) == (4, 3, 1)
+        assert (view.pending, view.attempts, view.reserved) == (0, 3, 0)
+        assert expiring.attempts == 0 and not ran.is_set()
+
+    def test_retry_deadline_rechecked_after_selection(self) -> None:
+        pool = self.pool(capacity=2)
+        entered, release = self.gate()
+        with patch("taskforge.scheduling.monotonic", return_value=100.0) as clock:
+            retry = pool.submit_scheduled(
+                Schedule(priority=10, start_within=10, max_retries=1, retry_delay=5),
+                fail_once,
+                self.event(),
+            )
+            self.retry_wait(pool, retry)
+            occupied = pool.submit(gated_task, entered, release)
+            assert entered.wait(LIMIT)
+            following = pool.submit(os.getpid)
+
+            def choose(*args: Any, **kwargs: Any) -> Any:
+                winner = builtins.max(*args, **kwargs)
+                if isinstance(winner, WorkItem) and winner.job is retry:
+                    clock.return_value = 111.0
+                return winner
+
+            with patch("taskforge.scheduling.max", choose, create=True):
+                clock.return_value = 105.0
+                release.set()
+                with self.case.assertRaises(DeadlineExpiredError):
+                    retry.result(LIMIT)
+                assert following.result(LIMIT) == occupied.result(LIMIT)
+        view = pool.snapshot()
+        assert (view.attempts, view.retries_scheduled, view.reserved) == (3, 1, 0)
+        assert retry.attempts == 1 and view.expired == 1
 
     def test_delayed_retry_and_drain_with_controlled_clock(self) -> None:
         pool = self.pool()
@@ -350,6 +437,126 @@ class ThreadSchedulingTests(SchedulingCases, unittest.TestCase):
 
 class ProcessSchedulingTests(SchedulingCases, unittest.TestCase):
     backend = ProcessRuntime
+
+    def test_long_retry_waits_are_bounded_until_the_original_due_time(self) -> None:
+        pool = self.pool(capacity=1)
+        delay = 3_000_000
+        after_slice, nearly_due = Event(), Event()
+        long_waits: list[float] = []
+        with patch("taskforge.scheduling.monotonic", return_value=10.0) as clock:
+
+            def wait(objects: Any, timeout: float | None = None) -> Any:
+                if timeout is not None and timeout >= 86_400:
+                    long_waits.append(timeout)
+                    if len(long_waits) == 1:
+                        clock.return_value = 86_410.0
+                        return []  # A bounded wait elapsed without a notification.
+                    after_slice.set()
+                if timeout == 1.0:
+                    nearly_due.set()
+                # Simulate the POSIX controller path without overflowing the host.
+                return wait_connections(
+                    objects, None if timeout is None else min(timeout, 86_400)
+                )
+
+            with (
+                patch(
+                    "taskforge.process_runtime.sys", SimpleNamespace(platform="linux")
+                ),
+                patch("taskforge.process_runtime.wait_connections", wait),
+            ):
+                retry = pool.submit_scheduled(
+                    Schedule(max_retries=1, retry_delay=delay), fail_once, self.event()
+                )
+                assert after_slice.wait(LIMIT)
+                pool.shutdown(wait=False)
+                with pool._changed:
+                    assert retry.state is JobState.PENDING and retry.attempts == 1
+                    clock.return_value = 10.0 + delay - 1
+                    pool._signal()
+                assert nearly_due.wait(LIMIT)
+                assert retry.state is JobState.PENDING and retry.attempts == 1
+                with pool._changed:
+                    clock.return_value = 10.0 + delay
+                    pool._signal()
+                assert retry.result(LIMIT) == 42 and retry.attempts == 2
+        assert long_waits and all(timeout <= 86_400 for timeout in long_waits)
+
+    def test_long_retry_wait_wakes_for_cancellation_and_last_worker_loss(self) -> None:
+        before = {child.pid for child in mp.active_children()}
+        pool = ProcessRuntime(1, 1)
+        self.addCleanup(pool.shutdown, cancel_pending=True, timeout=LIMIT)
+        process = pool._workers[0].process
+        waiting = Event()
+        observed: list[float] = []
+
+        def wait(objects: Any, timeout: float | None = None) -> Any:
+            if timeout is not None and timeout >= 80_000:
+                observed.append(timeout)
+                waiting.set()
+            return wait_connections(objects, timeout)
+
+        with (
+            patch("taskforge.scheduling.monotonic", return_value=10.0),
+            patch("taskforge.process_runtime.wait_connections", wait),
+        ):
+            schedule = Schedule(max_retries=1, retry_delay=3_000_000)
+            cancelled = pool.submit_scheduled(schedule, fail_once, self.event())
+            assert waiting.wait(LIMIT)
+            assert cancelled.cancel()
+            with self.assertRaises(JobCancelledError):
+                cancelled.result(0)
+            assert cancelled.attempts == 1
+            waiting.clear()
+            lost = pool.submit_scheduled(schedule, fail_once, self.event())
+            self.retry_wait(pool, lost)
+            assert waiting.wait(LIMIT)
+            process.terminate()
+            with self.assertRaises(WorkerLostError):
+                lost.result(LIMIT)
+            assert lost.attempts == 1
+        pool.shutdown(timeout=LIMIT)
+        assert observed and all(timeout <= 86_400 for timeout in observed)
+        assert {child.pid for child in mp.active_children()} == before
+
+    def test_long_pending_deadline_is_preserved_while_worker_is_busy(self) -> None:
+        pool = self.pool(capacity=1)
+        release = self.occupy(pool)
+        waiting, nearly_due = Event(), Event()
+        observed: list[float] = []
+
+        def wait(objects: Any, timeout: float | None = None) -> Any:
+            if timeout is not None and timeout >= 80_000:
+                observed.append(timeout)
+                waiting.set()
+            if timeout == 1.0:
+                nearly_due.set()
+            return wait_connections(
+                objects, None if timeout is None else min(timeout, 86_400)
+            )
+
+        with (
+            patch("taskforge.scheduling.monotonic", return_value=10.0) as clock,
+            patch("taskforge.process_runtime.sys", SimpleNamespace(platform="linux")),
+            patch("taskforge.process_runtime.wait_connections", wait),
+        ):
+            job = pool.submit_scheduled(Schedule(start_within=3_000_000), os.getpid)
+            try:
+                assert waiting.wait(LIMIT)
+                with pool._changed:
+                    clock.return_value = 3_000_009.0
+                    pool._signal()
+                assert nearly_due.wait(LIMIT)
+                with pool._changed:
+                    assert job.state is JobState.PENDING
+                    clock.return_value = 3_000_010.0
+                    pool._signal()
+                with self.assertRaises(DeadlineExpiredError):
+                    job.result(LIMIT)
+                assert job.attempts == 0
+            finally:
+                release.set()
+        assert observed and all(timeout <= 86_400 for timeout in observed)
 
     def test_crash_and_codec_failures_never_retry(self) -> None:
         pool = self.pool(2)

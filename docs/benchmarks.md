@@ -4,7 +4,7 @@ From the source checkout, run `python -m benchmarks` for a short JSON report. Us
 
 ## Measurement boundaries
 
-The recorded short run used the runtime at commit 873d52c. The short run used Windows 11 build 26300, an Intel Core i7-14650HX with 24 logical CPUs, and 64-bit CPython 3.15.2. Each backend ran with 1 and 2 workers, capacity 4, the same 32 input values shuffled with seed 731, one warm-up per scenario and three measured batches. Each batch measures from before the first submission through retrieval and verification of every result with `perf_counter()`. Verification of final snapshot deltas is outside the timed interval. Returned value, attempt and terminal counts are checked. For OS-level containment the recorded invocation used a 180-second outer timeout:
+The recorded short run used the Phase 5 runtime represented by public commit `45be4a2`, on Windows 11 build 26300 with an Intel Core i7-14650HX, 24 logical CPUs, and 64-bit CPython 3.15.2. Each backend ran with 1 and 2 workers, capacity 4, the same 32 input values shuffled with seed 731, one warm-up per scenario and three measured batches. Each batch measures from before the first submission through retrieval and verification of every result with `perf_counter()`. Verification of final snapshot deltas is outside the timed interval. Returned value, attempt and terminal counts are checked. For OS-level containment the recorded invocation used a 180-second outer timeout:
 
 ```sh
 python -c "import subprocess,sys; subprocess.run([sys.executable,'-m','benchmarks','--output','results.json'],timeout=180,check=True)"
