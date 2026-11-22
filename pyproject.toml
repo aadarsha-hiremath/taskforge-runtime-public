@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/aadarsha-hiremath/taskforge-runtime"
+Repository = "https://github.com/aadarsha-hiremath/taskforge-runtime-public"
 
 [project.scripts]
 taskforge = "taskforge.__main__:main"

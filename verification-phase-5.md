@@ -1,6 +1,6 @@
 # Phase 5 engineering audit
 
-Base `35455c12b0d56159cbdcbff03e0310fa7353af37`, Windows x64, 14 November 2026. Clean main, fetched origin/main and FETCH_HEAD matched before branching. The first fetch required account selection. Fetching with the stored repository-owner account succeeded without a global configuration change.
+This historical audit ran on Windows x64 on 14 November 2026 against the original development branch. Its Phase 4 baseline is represented in the public history by `ec47e24`. The development checkout was clean and synchronized before branching.
 
 ## Test evidence
 
@@ -36,9 +36,9 @@ After the exception-hook fix, three further fresh 3.15.2 processes passed all 67
 
 ## Source hygiene and licensing
 
-	Reviewed tracked inventory, ignore rules, packaging configuration and all 18 commits reachable from local refs at the branch point. A local Git blob scan covered 66 unique historical blobs for private-key headers, common GitHub/OpenAI/AWS token formats and credential assignments. The only candidate path was `tests/test_observability.py`, containing a deliberately fake log-redaction marker. The largest baseline blob was the 20,238-byte README. No dedicated secret-scanner executable was found on PATH. Pattern matching cannot certify the absence of secrets, and the scan did not inspect unreachable objects, untracked user files or remote services.
+Reviewed tracked inventory, ignore rules, packaging configuration and all 18 commits reachable from local refs at the branch point. A local Git blob scan covered 66 unique historical blobs for private-key headers, common GitHub/OpenAI/AWS token formats and credential assignments. The only candidate path was `tests/test_observability.py`, containing a deliberately fake log-redaction marker. The largest baseline blob was the 20,238-byte README. No dedicated secret-scanner executable was found on PATH. Pattern matching cannot certify the absence of secrets, and the scan did not inspect unreachable objects, untracked user files or remote services.
 
-Home-specific paths in two old verification records were normalized in the current tree. Prior commits and their Git author identities remain in history. The tracked distribution excludes virtual environments, local build directories and caches. The benchmark JSON is a small intentional measurement artifact containing platform/CPU details and no machine name. Runtime dependencies are empty. Packaging, typing and lint tools are development dependencies and are not vendored in the wheel. At the time of the Phase 5 audit, the repository had no selected project license. Subsequently, on 14 November 2026, the MIT License was added in commit `448562f`, along with the corresponding package metadata. The project remains at version 0.4.0. The decision to make the repository public remains with the owner.
+Home-specific paths in two old verification records were normalized in the current tree. Prior commits and their Git author identities remain in history. The tracked distribution excludes virtual environments, local build directories and caches. The benchmark JSON is a small intentional measurement artifact containing platform/CPU details and no machine name. Runtime dependencies are empty. Packaging, typing and lint tools are development dependencies and are not vendored in the wheel. At the time of the Phase 5 audit, the repository had no selected project license. The MIT License and its package metadata were added on 14 November 2026 in the change represented by public commit `b4c8d90`. The project remains at version 0.4.0.
 
 ## Measurement and reproduction
 
